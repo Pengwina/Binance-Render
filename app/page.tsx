@@ -28,6 +28,45 @@ function snapshotKey(asset:Asset, venue:string) {
  return 'options-lab:snapshot:v1:'+asset+':'+venue;
 }
 
+const dayMs=86400000;
+const rolloverHourMs=8*3600000;
+const openingWindowMs=5*60000;
+
+function rolloverAt(time:number) {
+ return Math.floor((time-rolloverHourMs)/dayMs)*dayMs+rolloverHourMs;
+}
+
+type OpeningMove = {
+ rollover:number; captured:number; expiry:number; spot:number; iv:number;
+ lower:number; upper:number; venues:string[];
+};
+
+function openingMove(feeds:Feed[], completed:number):OpeningMove|null {
+ const rollover=rolloverAt(completed);
+ const fresh=feeds.filter(feed=>feed.time>=rollover && completed-feed.time<=180000 && feed.spot>0);
+ if(!fresh.length)return null;
+ const captured=Math.max(...fresh.map(feed=>feed.time));
+ const options=fresh.flatMap(feed=>feed.options.filter(o=>o.expiry>captured&&o.time>=rollover&&feed.time-o.time<300000));
+ if(!options.length)return null;
+ const expiry=Math.min(...options.map(o=>o.expiry));
+ const spot=median(fresh.map(feed=>feed.spot));
+ const chain=options.filter(o=>o.expiry===expiry);
+ const strike=chain.reduce((best,o)=>Math.abs(o.strike-spot)<Math.abs(best-spot)?o.strike:best,chain[0].strike);
+ const iv=weightedIV(chain.filter(o=>o.strike===strike));
+ if(!iv||iv<=0)return null;
+ const move=spot*iv*Math.sqrt((expiry-captured)/(365.25*dayMs));
+ return {rollover,captured,expiry,spot,iv,lower:spot-move,upper:spot+move,venues:fresh.map(feed=>feed.venue)};
+}
+
+function readOpening(key:string):OpeningMove|null {
+ try {
+  const raw=localStorage.getItem(key);
+  return raw?JSON.parse(raw) as OpeningMove:null;
+ } catch {
+  return null;
+ }
+}
+
 const VENUES=['Deribit','OKX','Bybit','Binance'];
 const money=(n:number|null|undefined)=>n===null||n===undefined||!Number.isFinite(n)?'—':'$'+numberFormatters[0].format(n);
 const compactFormatter=new Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:2});
@@ -45,11 +84,15 @@ function Dashboard({asset,setAsset}:{asset:Asset;setAsset:(asset:Asset)=>void}){
  const assetName=asset==='BTC'?'Bitcoin':'Ethereum';
  const bucketSize=asset==='BTC'?2500:50;
  const [feeds,setFeeds]=useState<Record<string,Feed>>({}),[errors,setErrors]=useState<Record<string,string>>({}),[busy,setBusy]=useState(false),[enabled,setEnabled]=useState(VENUES),[expiry,setExpiry]=useState('all'),[tab,setTab]=useState('Overview'),[gross,setGross]=useState(false),[range,setRange]=useState('25'),[auto,setAuto]=useState(true),[clock,setClock]=useState(Date.now()),[search,setSearch]=useState('');
+ const openingKey='options-lab:opening-move:v1:'+asset;
+ const [opening,setOpening]=useState<OpeningMove|null>(null);
+ const openingRef=useRef<OpeningMove|null>(null);
  const [loadingVenue,setLoadingVenue]=useState<string|null>(null);
  const refreshing=useRef(false),controller=useRef<AbortController|null>(null),mounted=useRef(false);
  const refresh=useCallback(async()=>{
   if(refreshing.current)return;
   refreshing.current=true;setBusy(true);
+  const refreshed:Feed[]=[];
   try {for(const venue of VENUES){
    if(!mounted.current)break;
    setLoadingVenue(venue);
@@ -58,16 +101,30 @@ function Dashboard({asset,setAsset}:{asset:Asset;setAsset:(asset:Asset)=>void}){
    try{
     const j=await fetchMarket(venue,asset,abort.signal);
     if(!mounted.current)break;
+    refreshed.push(j);
     try {sessionStorage.setItem(snapshotKey(asset,venue),JSON.stringify(j))} catch {}
     startTransition(()=>{setFeeds(f=>({...f,[venue]:j}));setErrors(e=>{const x={...e};delete x[venue];return x});setClock(Date.now())});
    }catch(e){if(mounted.current)setErrors(x=>({...x,[venue]:abort.signal.aborted?'Timed out; continuing with other exchanges':e instanceof Error?e.message:'Unavailable'}))}
    finally{clearTimeout(timeout)}
    // Give input, painting and chart commits time between feeds.
    await new Promise(resolve=>setTimeout(resolve,120));
-  }}finally{refreshing.current=false;if(mounted.current){setLoadingVenue(null);setBusy(false)}}
- },[asset]);
+  }
+   if(mounted.current){
+    const saved=readOpening(openingKey)??openingRef.current;
+    const completed=Date.now();
+    const next=saved?.rollover===rolloverAt(completed)?saved:openingMove(refreshed,completed);
+    if(next){
+     openingRef.current=next;
+     setOpening(next);
+     if(next!==saved)try {localStorage.setItem(openingKey,JSON.stringify(next))} catch {}
+    }
+   }
+  }finally{refreshing.current=false;if(mounted.current){setLoadingVenue(null);setBusy(false)}}
+ },[asset,openingKey]);
  useEffect(()=>{
   mounted.current=true;
+  openingRef.current=readOpening(openingKey);
+  setOpening(openingRef.current);
   const saved:Record<string,Feed>={};
   for(const venue of VENUES){
    try {
@@ -78,7 +135,7 @@ function Dashboard({asset,setAsset}:{asset:Asset;setAsset:(asset:Asset)=>void}){
    } catch {}
   }
   setFeeds(saved);
-  const launch=setTimeout(()=>void refresh(),0);return()=>{clearTimeout(launch);mounted.current=false;controller.current?.abort()}},[asset,refresh]);
+  const launch=setTimeout(()=>void refresh(),0);return()=>{clearTimeout(launch);mounted.current=false;controller.current?.abort()}},[asset,openingKey,refresh]);
  useEffect(()=>{const t=setInterval(()=>{if(document.visibilityState==='visible')startTransition(()=>setClock(Date.now()))},60000);return()=>clearInterval(t)},[]);
  useEffect(()=>{if(!auto)return;const tick=()=>{if(document.visibilityState==='visible'){setClock(Date.now());void refresh()}};const t=setInterval(tick,60000);document.addEventListener('visibilitychange',tick);return()=>{clearInterval(t);document.removeEventListener('visibilitychange',tick)}},[auto,refresh]);
  const active=useMemo(()=>Object.values(feeds).filter(f=>enabled.includes(f.venue)),[feeds,enabled]);
@@ -96,7 +153,9 @@ function Dashboard({asset,setAsset}:{asset:Asset;setAsset:(asset:Asset)=>void}){
  const pain=useMemo(()=>maxPain(scope),[scope]),dvol=feeds.Deribit?.dvolTime&&feeds.Deribit.time-feeds.Deribit.dvolTime<300000?feeds.Deribit.dvol:null;
  const smile=useMemo(()=>tab!=='Vol Smile'?[]:[...new Set(detail.map(o=>o.strike))].sort((a,b)=>a-b).filter(inRange).map(strike=>{const c=weightedIV(detail.filter(o=>o.strike===strike&&o.type==='C')),p=weightedIV(detail.filter(o=>o.strike===strike&&o.type==='P'));return {strike,Call:c===null?null:c*100,Put:p===null?null:p*100}}),[tab,detail,range,spot]);
  const invalid=sum(scope.filter(o=>!greeks(o,spot,now).valid).map(o=>o.oi)),expected=selected?.atm&&spot?spot*selected.atm*Math.sqrt(selected.days/365.25):null;
- const download=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify({exportedAt:new Date().toISOString(),scope:{asset,expiry,enabled},model:'Zero-discount forward proxy; calls positive / puts negative; USD per 1% move',feeds:active},null,2)],{type:'application/json'})),a=document.createElement('a');a.href=url;a.download=asset.toLowerCase()+'-options-snapshot.json';a.click();URL.revokeObjectURL(url)};
+ const currentOpening=opening?.rollover===rolloverAt(clock)?opening:null;
+ const lateOpening=currentOpening&&currentOpening.captured-currentOpening.rollover>=openingWindowMs;
+ const download=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify({exportedAt:new Date().toISOString(),scope:{asset,expiry,enabled},model:'Zero-discount forward proxy; calls positive / puts negative; USD per 1% move',feeds:active,rolloverExpectedMove:currentOpening},null,2)],{type:'application/json'})),a=document.createElement('a');a.href=url;a.download=asset.toLowerCase()+'-options-snapshot.json';a.click();URL.revokeObjectURL(url)};
  const chart=(horizontal=false)=><ResponsiveContainer width="100%" height={horizontal?540:285}><BarChart data={visible} layout={horizontal?'vertical':'horizontal'} margin={{top:12,right:25,left:horizontal?5:12,bottom:24}}><CartesianGrid stroke="#25313a" strokeDasharray="2 4" horizontal={!horizontal} vertical={horizontal}/>{horizontal?<><XAxis type="number" tickFormatter={n=>'$'+compact(n)} label={{value:'Estimated GEX · USD / 1% move',position:'bottom',fill:'#7f939f',fontSize:11}}/><YAxis type="number" dataKey="strike" domain={['dataMin','dataMax']} tickFormatter={n=>'$'+compact(n)} width={70}/><ReferenceLine x={0} stroke="#81929b"/><ReferenceLine y={spot} stroke="#edcf87" strokeDasharray="4 4" label={{value:'SPOT',fill:'#edcf87',fontSize:10}}/></>:<><XAxis dataKey="strike" type="number" domain={['dataMin','dataMax']} tickFormatter={n=>'$'+compact(n)} label={{value:`${asset} strike · USD`,position:'bottom',fill:'#7f939f',fontSize:11}}/><YAxis tickFormatter={n=>'$'+compact(n)} width={70}/><ReferenceLine y={0} stroke="#81929b"/><ReferenceLine x={spot} stroke="#edcf87" strokeDasharray="4 4" label={{value:'SPOT',fill:'#edcf87',fontSize:10}}/></>}<Tooltip contentStyle={tip} formatter={(v:any)=>money(Number(v))} labelFormatter={v=>'Strike '+money(Number(v))}/><Bar isAnimationActive={false} dataKey="positive" stackId="g" fill="#58d5a1" name={gross?'Gross gamma':'Positive GEX'} barSize={6}/><Bar isAnimationActive={false} dataKey="negative" stackId="g" fill="#ee8493" name="Negative GEX" barSize={6}/></BarChart></ResponsiveContainer>;
  return <main><header><a className="brand" href="/"><b className="brand-icon">₿</b><span>OPTIONS<span className="brand-light"> / LAB</span></span></a><div className="header-right"><select aria-label="Options asset" value={asset} onChange={e=>setAsset(e.target.value==='ETH'?'ETH':'BTC')}><option value="BTC">BTC · Bitcoin</option><option value="ETH">ETH · Ethereum</option></select><span className="tag muted">TEST BUILD · 02</span></div></header>
  <div className="title-row"><div><div className="eyebrow">CROSS-EXCHANGE INTELLIGENCE</div><h1>{assetName} options, <span>in one view.</span></h1><p className="subtitle">A consolidated view of positioning, volatility and estimated gamma exposure.</p></div><div className="actions"><button onClick={download} disabled={!all.length}>↓ Export snapshot</button><button className="primary" onClick={refresh} disabled={busy}>{busy?'Loading '+(loadingVenue||'feeds')+'…':'↻ Refresh data'}</button></div></div>
@@ -106,7 +165,18 @@ function Dashboard({asset,setAsset}:{asset:Asset;setAsset:(asset:Asset)=>void}){
  <div className="metrics">{[[`${asset} reference index`,money(spot||null),'Median of included venue indexes'],['Open interest',totalOI?money(totalOI*spot):'—',`${fmt(totalOI,1)} ${asset} · selected expiry scope`],[gross?'Gross gamma':'Estimated net GEX',scope.length?(net<0?'−':'+')+'$'+compact(Math.abs(net)):'—',gross?'All gamma positive · per 1% move':'Calls + / puts − · per 1% move'],['Put / call OI',calls?fmt(puts/calls):'—',`${asset}-normalised open interest`],['Max pain',money(pain),expiry==='all'?'Combined-expiry payoff proxy':'Minimum expiry payout · USD proxy'],['Deribit DVOL',dvol?fmt(dvol,1)+'%':'—',stale.some(f=>f.venue==='Deribit')?'Saved Deribit index':'Deribit index']].map(([label,value,sub])=><div className="metric" key={label}><span>{label}</span><strong className={label==='Estimated net GEX'?(net<0?'red':'green'):''}>{value}</strong><small>{sub}</small></div>)}</div>
  <div className="toolbar"><nav>{['Overview','GEX Profile','Strike × Expiry','Max Pain','Vol Smile','3D Vol','Chain'].map(t=><button className={tab===t?'active':''} key={t} onClick={()=>setTab(t)}>{t}</button>)}</nav><div className="filters"><label>Expiry <select value={expiry} onChange={e=>setExpiry(e.target.value)}><option value="all">All expiries</option>{expiries.map(e=><option value={e.expiry} key={e.expiry}>{date(e.expiry)}</option>)}</select></label><label>Strikes <select value={range} onChange={e=>setRange(e.target.value)}><option value="15">±15% spot</option><option value="25">±25% spot</option><option value="50">±50% spot</option><option value="all">All strikes</option></select></label><label>Gamma <select value={gross?'gross':'signed'} onChange={e=>setGross(e.target.value==='gross')}><option value="signed">Signed proxy</option><option value="gross">Gross exposure</option></select></label></div></div>
  {!scope.length?<div className="empty">{busy?`Loading ${asset} options data…`:all.length?'No contracts in this expiry. Choose another expiry.':'No fresh feeds selected. Enable an exchange or refresh to retry.'}</div>:<>
- {tab==='Overview'&&<><div className="overview-grid"><Panel title="Gamma exposure by strike" caption={`USD hedge-notional change per 1% ${asset} move · selected expiry scope`} extra={<span className="tag">{gross?'GROSS':net<0?'NEGATIVE PROXY':'POSITIVE PROXY'}</span>}>{chart()}<div className="chart-footer"><span className="green">■ Positive</span><span className="red">■ Negative</span><span>Spot {money(spot)}</span></div></Panel><Panel title="ATM volatility term structure" caption="OI-weighted IV at nearest-to-spot strike · all included expiries"><ResponsiveContainer width="100%" height={285}><LineChart data={expiries.map(e=>({...e,iv:e.atm===null?null:e.atm*100}))} margin={{top:20,left:0,right:20,bottom:24}}><CartesianGrid stroke="#25313a" strokeDasharray="2 4"/><XAxis dataKey="expiry" tickFormatter={n=>date(n).slice(0,6)} label={{value:'Expiry · UTC',position:'bottom',fill:'#7f939f',fontSize:11}}/><YAxis domain={['auto','auto']} tickFormatter={n=>n+'%'} width={50}/><Tooltip contentStyle={tip} labelFormatter={v=>date(Number(v))} formatter={(v:any)=>fmt(Number(v),2)+'%'}/><Line isAnimationActive={false} dataKey="iv" name="ATM IV" stroke="#65baff" strokeWidth={2} dot={{r:3}} connectNulls={false}/></LineChart></ResponsiveContainer><div className="chart-footer">Mark IV · contracts with missing IV excluded</div></Panel></div><div className="levels">{[['Call concentration',money(walls[0]?.strike),'Largest call gamma above spot'],['Second call level',money(walls[1]?.strike),'Second-largest call gamma above spot'],['Put concentration',money(putWall?.strike),'Largest put gamma below spot'],['Expected move · '+(detailExpiry?date(detailExpiry):'—'),expected?money(spot-expected)+' – '+money(spot+expected):'—','Spot ± ATM IV × √time · 1σ approximation']].map(([a,b,c])=><div key={a}><span>{a}</span><strong>{b}</strong><small>{c}</small></div>)}</div></>}
+ {tab==='Overview'&&<><div className="overview-grid"><Panel title="Gamma exposure by strike" caption={`USD hedge-notional change per 1% ${asset} move · selected expiry scope`} extra={<span className="tag">{gross?'GROSS':net<0?'NEGATIVE PROXY':'POSITIVE PROXY'}</span>}>{chart()}<div className="chart-footer"><span className="green">■ Positive</span><span className="red">■ Negative</span><span>Spot {money(spot)}</span></div></Panel><Panel title="ATM volatility term structure" caption="OI-weighted IV at nearest-to-spot strike · all included expiries"><ResponsiveContainer width="100%" height={285}><LineChart data={expiries.map(e=>({...e,iv:e.atm===null?null:e.atm*100}))} margin={{top:20,left:0,right:20,bottom:24}}><CartesianGrid stroke="#25313a" strokeDasharray="2 4"/><XAxis dataKey="expiry" tickFormatter={n=>date(n).slice(0,6)} label={{value:'Expiry · UTC',position:'bottom',fill:'#7f939f',fontSize:11}}/><YAxis domain={['auto','auto']} tickFormatter={n=>n+'%'} width={50}/><Tooltip contentStyle={tip} labelFormatter={v=>date(Number(v))} formatter={(v:any)=>fmt(Number(v),2)+'%'}/><Line isAnimationActive={false} dataKey="iv" name="ATM IV" stroke="#65baff" strokeWidth={2} dot={{r:3}} connectNulls={false}/></LineChart></ResponsiveContainer><div className="chart-footer">Mark IV · contracts with missing IV excluded</div></Panel></div><div className="levels">{[['Call concentration',money(walls[0]?.strike),'Largest call gamma above spot'],['Second call level',money(walls[1]?.strike),'Second-largest call gamma above spot'],['Put concentration',money(putWall?.strike),'Largest put gamma below spot'],['Live expected move · '+(detailExpiry?date(detailExpiry):'—'),expected?money(spot-expected)+' – '+money(spot+expected):'—','Spot ± ATM IV × √time · 1σ approximation']].map(([a,b,c])=><div key={a}><span>{a}</span><strong>{b}</strong><small>{c}</small></div>)}</div>
+ <Panel title="Expected move at rollover" caption="Fixed range for the next listed expiry after the 08:00 UTC daily rollover.">
+  <div className="levels">
+   <div><span>{lateOpening?'Late capture · '+date(rolloverAt(clock)):'Rollover snapshot · '+date(rolloverAt(clock))}</span><strong>{currentOpening?money(currentOpening.lower)+' – '+money(currentOpening.upper):'—'}</strong><small>{currentOpening?'Expires '+date(currentOpening.expiry)+' at 08:00 UTC':'Waiting for a fresh options snapshot.'}</small></div>
+   {currentOpening&&<>
+    <div><span>Captured (UTC)</span><strong>{new Date(currentOpening.captured).toISOString().slice(11,19)}</strong><small>{currentOpening.venues.length}/4 exchanges · saved in this browser</small></div>
+    <div><span>Spot at capture</span><strong>{money(currentOpening.spot)}</strong><small>Fixed reference price</small></div>
+    <div><span>ATM IV at capture</span><strong>{fmt(currentOpening.iv*100,1)}%</strong><small>Spot ± ATM IV × √time · 1σ approximation</small></div>
+   </>}
+  </div>
+  <div className="chart-footer">{lateOpening?'The dashboard first received usable data after the five-minute rollover window. This range is based on the capture time.':'Keep the dashboard visible with auto-refresh enabled around 08:00 UTC to capture the rollover range.'}</div>
+ </Panel></>}
  {tab==='GEX Profile'&&<div className="profile-layout"><Panel title="GEX profile" caption="Strike (USD) vertically · hover for estimated exposure">{chart(true)}</Panel><Panel title="Reading this profile" caption="A model of exposure, not observed dealer inventory"><div className="explainer"><h3 className={net<0?'red':'green'}>{gross?'Gross gamma concentration':net<0?'Negative signed proxy':'Positive signed proxy'}</h3><p>Signed mode assigns calls positive and puts negative. This does not identify which side dealers actually hold.</p><dl><dt>Call concentration</dt><dd>{money(walls[0]?.strike)}</dd><dt>Second call level</dt><dd>{money(walls[1]?.strike)}</dd><dt>Put concentration</dt><dd>{money(putWall?.strike)}</dd><dt>Gamma flip / HVL</dt><dd>Not estimated</dd></dl><p>A strike-profile zero crossing is not a gamma flip. A flip requires repricing the whole portfolio over hypothetical spot prices and a positioning model.</p><p>Concentrations are not guaranteed support or resistance. Use the expiry selector to separate near-term positioning from longer-dated exposure.</p></div></Panel></div>}
  {tab==='Strike × Expiry'&&<Panel title="Strike × expiry exposure" caption={`Estimated GEX in USD per 1% move · strikes grouped into ${money(bucketSize)} buckets`}><Heatmap bucketSize={bucketSize} options={scope} spot={spot} now={now} gross={gross} range={range}/></Panel>}
  {tab==='Max Pain'&&<Panel title="Expiry payout profile" caption={expiry==='all'?'All-expiry scenario: assumes one common settlement price across dates. Not a single actual expiry.':`Sum of intrinsic payout × ${asset} open interest. USD-equivalent payoff proxy.`}><ResponsiveContainer width="100%" height={420}><AreaChart data={painCurve(scope).filter(r=>inRange(r.strike))} margin={{top:25,left:25,right:25,bottom:25}}><CartesianGrid stroke="#25313a" strokeDasharray="2 4"/><XAxis dataKey="strike" type="number" domain={['dataMin','dataMax']} tickFormatter={n=>'$'+compact(n)} label={{value:'Hypothetical settlement price · USD',position:'bottom',fill:'#7f939f'}}/><YAxis tickFormatter={n=>'$'+compact(n)} width={70}/><Tooltip contentStyle={tip} formatter={(v:any)=>money(Number(v))}/><Area isAnimationActive={false} dataKey="payout" name="Intrinsic payout" fill="#254658" stroke="#65baff"/>{pain&&<ReferenceLine x={pain} stroke="#edcf87" label={{value:'MAX PAIN',fill:'#edcf87',fontSize:10}}/>}</AreaChart></ResponsiveContainer><div className="chart-footer">Max pain is a payout calculation, not a price forecast.</div></Panel>}
