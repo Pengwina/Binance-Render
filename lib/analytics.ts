@@ -1,0 +1,17 @@
+import type {Option} from './market';
+export const sum=(a:number[])=>a.reduce((s,x)=>s+x,0);
+export const median=(a:number[])=>{const b=a.filter(x=>Number.isFinite(x)&&x>0).sort((a,b)=>a-b);return b.length?(b[Math.floor((b.length-1)/2)]+b[Math.floor(b.length/2)])/2:0};
+export function cdf(x:number){const t=1/(1+0.2316419*Math.abs(x)),d=0.3989422804014327*Math.exp(-x*x/2),p=1-d*t*(0.319381530+t*(-0.356563782+t*(1.781477937+t*(-1.821255978+t*1.330274429))));return x>=0?p:1-p;}
+export function greeks(o:Option,spot:number,now:number){const t=(o.expiry-now)/31557600000,v=o.iv;if(!v||v<=0||t<=0||spot<=0)return {gamma:0,delta:0,valid:false};const f=o.forward,d1=(Math.log(f/o.strike)+v*v*t/2)/(v*Math.sqrt(t));return {gamma:Math.exp(-d1*d1/2)/Math.sqrt(2*Math.PI)*f/(spot*spot*v*Math.sqrt(t)),delta:f/spot*(cdf(d1)-(o.type==='P'?1:0)),valid:true};}
+export function gex(o:Option,s:number,now:number,gross=false){return greeks(o,s,now).gamma*o.oi*s*s*.01*(gross||o.type==='C'?1:-1)}
+export function profile(options:Option[],spot:number,now:number,gross=false){const m=new Map<number,{strike:number;gex:number;call:number;put:number;oi:number}>();for(const o of options){const r=m.get(o.strike)||{strike:o.strike,gex:0,call:0,put:0,oi:0};const g=Math.abs(gex(o,spot,now,true));r.gex+=g*(gross||o.type==='C'?1:-1);r[o.type==='C'?'call':'put']+=g;r.oi+=o.oi;m.set(o.strike,r)}return [...m.values()].sort((a,b)=>a.strike-b.strike)}
+// Aggregate once, then sweep strike buckets. Avoid scanning every option at every strike.
+export function painCurve(options:Option[]){
+ const buckets=new Map<number,{call:number;put:number}>();
+ let putQty=0,putValue=0,callQty=0,callValue=0;
+ for(const o of options){const b=buckets.get(o.strike)||{call:0,put:0};if(o.type==='C')b.call+=o.oi;else {b.put+=o.oi;putQty+=o.oi;putValue+=o.oi*o.strike}buckets.set(o.strike,b)}
+ return [...buckets.keys()].sort((a,b)=>a-b).map(strike=>{const b=buckets.get(strike)!;putQty-=b.put;putValue-=b.put*strike;const payout=Math.max(0,strike*callQty-callValue+putValue-strike*putQty);callQty+=b.call;callValue+=b.call*strike;return {strike,payout}});
+}
+export function maxPain(options:Option[]){if(!sum(options.map(o=>o.oi)))return null;return painCurve(options).reduce((a,b)=>b.payout<a.payout?b:a).strike;}
+export function weightedIV(options:Option[]){const usable=options.filter(o=>o.iv!==null&&o.iv>0);const total=sum(usable.map(o=>o.oi));return total?sum(usable.map(o=>o.iv!*o.oi))/total:usable.length?sum(usable.map(o=>o.iv!))/usable.length:null;}
+export function expiryStats(options:Option[],spot:number,now:number){return [...new Set(options.map(o=>o.expiry))].sort((a,b)=>a-b).map(expiry=>{const rows=options.filter(o=>o.expiry===expiry),k=rows.reduce((best,o)=>Math.abs(o.strike-spot)<Math.abs(best-spot)?o.strike:best,rows[0].strike),calls=sum(rows.filter(o=>o.type==='C').map(o=>o.oi)),puts=sum(rows.filter(o=>o.type==='P').map(o=>o.oi));const sideIV=(type:'C'|'P')=>{const side=rows.filter(o=>o.type===type&&o.iv&&o.iv>0);if(!side.length)return null;const closest=side.reduce((a,b)=>Math.abs(Math.abs(greeks(a,spot,now).delta)-.25)<Math.abs(Math.abs(greeks(b,spot,now).delta)-.25)?a:b);return Math.abs(Math.abs(greeks(closest,spot,now).delta)-.25)>.12?null:weightedIV(side.filter(o=>o.strike===closest.strike));};const p=sideIV('P'),c=sideIV('C');return {expiry,days:(expiry-now)/86400000,atm:weightedIV(rows.filter(o=>o.strike===k)),skew:p!==null&&c!==null?(p-c)*100:null,pc:calls?puts/calls:null,pain:maxPain(rows),oi:calls+puts,gex:sum(rows.map(o=>gex(o,spot,now)))};});}
