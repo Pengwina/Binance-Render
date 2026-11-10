@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: options-lab
+    runtime: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm ci --include=dev && npx next build --webpack
+    startCommand: npx next start --hostname 0.0.0.0
+    envVars:
+      - key: OPTIONS_LAB_PASSWORD
+        sync: false
