@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Options Lab | Cross-exchange dashboard",
-  description: "Live BTC and ETH options, volatility and estimated gamma exposure across Deribit, OKX, Bybit and Binance.",
+  description: "BTC, ETH, AVAX, HYPE, SOL, TRX and XRP options, volatility and estimated gamma exposure across Deribit, OKX, Bybit and Binance.",
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

@@ -1,12 +1,14 @@
+import {isAsset,supportsVenue} from '../../../lib/assets';
 import {loadFeed} from '../../../lib/market';
 
 export async function GET(req: Request) {
  const {searchParams} = new URL(req.url);
  const venue = searchParams.get('venue') || 'Deribit';
  const asset = searchParams.get('asset') ?? 'BTC';
- if (asset !== 'BTC' && asset !== 'ETH') {
+ if (!isAsset(asset)) {
   return Response.json({error: 'Unsupported asset'}, {status: 400});
  }
+ if (!supportsVenue(asset,venue)) return Response.json({venue,error: `${venue} does not list ${asset} options in this dashboard`}, {status: 400});
  try {
   return Response.json(await loadFeed(venue, asset), {headers: {'Cache-Control': 'private, max-age=45'}});
  } catch (error) {
